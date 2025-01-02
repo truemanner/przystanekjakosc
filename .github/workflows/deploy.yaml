@@ -1,0 +1,123 @@
+name: Deploy to Server
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  id-token: write
+  contents: write
+  packages: write
+  pull-requests: write
+  security-events: write
+
+jobs:
+  check:
+    name: prerequisites checks
+    runs-on: ubuntu-latest
+    outputs:
+      has_gh_secrets: ${{ steps.check-gh-key-secret.outputs.declared }}
+    steps:
+      - name: Check for GitHub Secret availability
+        id: check-gh-key-secret
+        shell: bash
+        run: |
+          if [[ ! -z  "${{ secrets.GITHUB_TOKEN }}" ]]; then
+            echo "All secrets are declared."
+            echo "declared=true" >> $GITHUB_OUTPUT;
+          else
+            echo "GITHUB_TOKEN secret is missing."
+            exit 1
+          fi
+
+  # security_scan:
+  #   name: Security scan
+  #   needs: [check]
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Checkout repository
+  #       uses: actions/checkout@v2
+
+  #     - name: Run Snyk to check for vulnerabilities
+  #       uses: snyk/actions/php@master
+  #       continue-on-error: true # To make sure that SARIF upload gets called
+  #       env:
+  #         SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+  #       with:
+  #         args: --sarif-file-output=snyk.sarif --severity-threshold=high
+        
+  #     - name: Upload result to GitHub Code Scanning
+  #       uses: github/codeql-action/upload-sarif@v2
+  #       with:
+  #         sarif_file: snyk.sarif
+
+  
+  tag_version:
+    name: Tag and Release
+    needs: [check]
+    if: needs.check.outputs.has_gh_secrets
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Set up Git user
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+      - name: Get the current tag
+        id: current_tag
+        run: echo ::set-output name=tag::$(git describe --tags --abbrev=0)
+
+      - name: Bump version and create tag
+        id: tag_version
+        run: |
+          NEW_TAG=v$(date +'%Y%m%d%H%M%S')
+          git tag $NEW_TAG
+          git push origin $NEW_TAG
+          echo ::set-output name=new_tag::$NEW_TAG
+
+      - name: Create GitHub Release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.tag_version.outputs.new_tag }}
+          release_name: Release ${{ steps.tag_version.outputs.new_tag }}
+          body: |
+            New release ${{ steps.tag_version.outputs.new_tag }}
+          draft: false
+          prerelease: false
+
+
+  get-and-deploy:
+    name: Deploy to server
+    needs: [tag_version]
+    runs-on: self-hosted
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up SSH
+      uses: webfactory/ssh-agent@v0.5.3
+      with:
+        ssh-private-key: ${{ secrets.DEPLOY_KEY }}
+
+    - name: Get last commit from git
+      run: git log -1 > version.txt
+
+    - name: Archive project files
+      run: zip -r ../website-przystanek.zip .
+
+    - name: Deploy to server
+      run: |
+        scp -P60022 -o StrictHostKeyChecking=no ../website-przystanek.zip deployer@warka.x-on.pl:/home/deployer/files-przystanek
+        ssh -p 60022 deployer@warka.x-on.pl "rm -rf /home/deployer/przystanekjakosc.pl/* && unzip -o /home/deployer/files-przystanek/website-przystanek.zip -d /home/deployer/przystanekjakosc.pl"
+
+    - name: Clean up
+      run: rm ../website-przystanek.zip
